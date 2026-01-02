@@ -1,99 +1,109 @@
 <?php
+/**
+ * Simple Secure REST Proxy
+ * -----------------------------------------------------
+ * This script forwards HTTP requests (GET, POST, PUT, DELETE)
+ * to a target URL passed as a query parameter (?url=...).
+ * It preserves JSON bodies and headers, adds timeout control,
+ * and limits access to safe destinations.
+ *
+ * Usage example:
+ *  curl --request POST \
+ *   --url 'https://yourdomain.com/proxy.php?url=https%3A%2F%2Fapi.example.com%2Fendpoint' \
+ *   --header 'Content-Type: application/json' \
+ *   --data '{"key":"value"}'
+ */
 
-  $url = $_REQUEST["url"];
+// --- CONFIGURATION ---
+$ALLOWED_DOMAINS = [
+    'pbx-panel.pishgaman.net',
+    'ms-pay.aminh.pro',
+    // add more allowed domains here for safety
+];
 
-  if(!$url) {
-    echo "You need to pass in a target URL.";
-    return;
-  }
+$TIMEOUT = 20; // seconds for cURL timeout
 
-  $response = "";
-  switch (getMethod()) {
-    case 'POST':
-      $response = makePostRequest(getPostData(), $url);
-      break;
-    case 'PUT':
-      $response = makePutRequest(getPutOrDeleteData($url), $url);
-      break;
-    case 'DELETE':
-      $response = makeDeleteRequest($url);
-      break;
-    case 'GET':
-      $response = makeGetRequest($url);
-      break;
-    default:
-      echo "This proxy only supports POST, PUT, DELETE AND GET REQUESTS.";
-      return;
-  }
+// --- HELPER: safe URL extraction ---
+$url = $_GET['url'] ?? $_POST['url'] ?? null;
 
-  echo $response;
+if (!$url) {
+    http_response_code(400);
+    echo json_encode(['error' => "Missing 'url' parameter."]);
+    exit;
+}
 
-  function getMethod() {
-    return $_SERVER["REQUEST_METHOD"]; 
-  }
+// validate and sanitize url
+$decodedUrl = urldecode($url);
+$host = parse_url($decodedUrl, PHP_URL_HOST);
 
-  function getPostData() {
-    return http_build_query($_POST);
-  }
+if (!$host || !in_array($host, $ALLOWED_DOMAINS, true)) {
+    http_response_code(403);
+    echo json_encode(['error' => "Access to this domain is not permitted."]);
+    exit;
+}
 
-  function getPutOrDeleteData($url) {
-    $data = substr(file_get_contents('php://input'), strlen($url));
-    return $data;
-  }
+// --- determine HTTP method ---
+$method = strtoupper($_SERVER['REQUEST_METHOD']);
 
-  function makePostRequest($data, $url) {
-    $httpHeader = array(
-    'Content-Type: application/json',
-    'Content-Length: ' . strlen($data));
-    
-    return makePutOrPostCurl('POST', $data, true, $httpHeader, $url);
-  }
+// --- read body if present ---
+$body = file_get_contents('php://input');
 
-  function makePutRequest($data, $url) {
+// --- init CURL ---
+$ch = curl_init($decodedUrl);
+curl_setopt_array($ch, [
+    CURLOPT_RETURNTRANSFER => true,
+    CURLOPT_FOLLOWLOCATION => true,
+    CURLOPT_CUSTOMREQUEST => $method,
+    CURLOPT_TIMEOUT => $TIMEOUT,
+    CURLOPT_USERAGENT => 'PHP Proxy/1.1',
+    CURLOPT_SSL_VERIFYPEER => true,
+    CURLOPT_HEADER => true, // to capture headers
+]);
 
-    return makePutOrPostCurl('PUT', $data, true, $httpHeader, $url);
-  }
+// --- set headers from client ---
+$client_headers = getallheaders();
+$curl_headers = [];
 
-  function makeDeleteRequest($url) {
-    $ch = initCurl($url);
-    curl_setopt($ch, CURLOPT_CUSTOMREQUEST, "DELETE");
-    $response = curl_exec($ch);
+foreach ($client_headers as $key => $value) {
+    // skip host, content-length — cURL handles those automatically
+    if (in_array(strtolower($key), ['host', 'content-length'])) continue;
+    $curl_headers[] = "$key: $value";
+}
+curl_setopt($ch, CURLOPT_HTTPHEADER, $curl_headers);
+
+// attach body for POST/PUT/PATCH
+if (in_array($method, ['POST', 'PUT', 'PATCH'])) {
+    curl_setopt($ch, CURLOPT_POSTFIELDS, $body);
+}
+
+// --- execute request ---
+$response = curl_exec($ch);
+if ($response === false) {
+    http_response_code(502);
+    echo json_encode(['error' => 'cURL error: ' . curl_error($ch)]);
     curl_close($ch);
-    return $response;
-  }
+    exit;
+}
 
-  function makeGetRequest($url) {
-    $ch = initCurl($url);
-    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+// --- separate headers and body ---
+$header_size = curl_getinfo($ch, CURLINFO_HEADER_SIZE);
+$http_code   = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+$headers     = substr($response, 0, $header_size);
+$body        = substr($response, $header_size);
 
-    $response = curl_exec($ch);
-    curl_close($ch);
+curl_close($ch);
 
-    return $response;
-  }
+// --- forward response ---
+http_response_code($http_code);
 
-  function makePutOrPostCurl($type, $data, $returnTransfer, $httpHeader, $url) {
+// forward key headers to client (e.g., content-type)
+foreach (explode("\r\n", $headers) as $header) {
+    if (stripos($header, 'Content-Type:') === 0 ||
+        stripos($header, 'Cache-Control:') === 0 ||
+        stripos($header, 'Pragma:') === 0
+    ) {
+        header($header);
+    }
+}
 
-    $ch = initCurl($url);
-    curl_setopt($ch, CURLOPT_CUSTOMREQUEST, $type);
-    curl_setopt($ch, CURLOPT_POSTFIELDS, $data);
-    curl_setopt($ch, CURLOPT_RETURNTRANSFER, $returnTransfer);
-    
-    $response = curl_exec($ch);
-    curl_close($ch);
-    return $response;
-  }
-
-  function initCurl($url) {
-    $httpHeader = array(
-    'Content-Type: application/x-www-form-urlencoded');
-
-    $ch = curl_init($url);
-    curl_setopt($ch, CURLOPT_HTTPHEADER, $httpHeader);
-    curl_setopt($ch, CURLOPT_USERAGENT, 'Mozilla/5.0 (Windows NT 6.2; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/32.0.1667.0 Safari/537.36');
-
-    return $ch;
-  }
-
-
-?>
+echo $body;
