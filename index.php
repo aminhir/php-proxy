@@ -1,109 +1,79 @@
 <?php
-/**
- * Simple Secure REST Proxy
- * -----------------------------------------------------
- * This script forwards HTTP requests (GET, POST, PUT, DELETE)
- * to a target URL passed as a query parameter (?url=...).
- * It preserves JSON bodies and headers, adds timeout control,
- * and limits access to safe destinations.
- *
- * Usage example:
- *  curl --request POST \
- *   --url 'https://yourdomain.com/proxy.php?url=https%3A%2F%2Fapi.example.com%2Fendpoint' \
- *   --header 'Content-Type: application/json' \
- *   --data '{"key":"value"}'
- */
+// proxy.php – diagnostic version
+header('Content-Type: application/json');
 
-// --- CONFIGURATION ---
-$ALLOWED_DOMAINS = [
-    'pbx-panel.pishgaman.net',
-    'ms-pay.aminh.pro',
-    // add more allowed domains here for safety
+if (!isset($_GET['url'])) {
+    http_response_code(400);
+    echo json_encode(['error' => 'Missing "url" parameter']);
+    exit;
+}
+
+$url = $_GET['url'];
+$method = $_SERVER['REQUEST_METHOD'];
+$headers = getallheaders();
+
+// Remove Hop‑by‑hop headers and internal headers
+$skipHeaders = [
+    'Host', 'Connection', 'Keep-Alive', 'Proxy-Authenticate',
+    'Proxy-Authorization', 'TE', 'Trailers', 'Transfer-Encoding',
+    'Upgrade', 'Content-Length', 'Content-Type'
 ];
 
-$TIMEOUT = 20; // seconds for cURL timeout
-
-// --- HELPER: safe URL extraction ---
-$url = $_GET['url'] ?? $_POST['url'] ?? null;
-
-if (!$url) {
-    http_response_code(400);
-    echo json_encode(['error' => "Missing 'url' parameter."]);
-    exit;
+$curlHeaders = [];
+foreach ($headers as $key => $value) {
+    if (in_array($key, $skipHeaders, true)) continue;
+    $curlHeaders[] = "$key: $value";
 }
 
-// validate and sanitize url
-$decodedUrl = urldecode($url);
-$host = parse_url($decodedUrl, PHP_URL_HOST);
+$ch = curl_init();
+curl_setopt($ch, CURLOPT_URL, $url);
+curl_setopt($ch, CURLOPT_CUSTOMREQUEST, $method);
+curl_setopt($ch, CURLOPT_HTTPHEADER, $curlHeaders);
+curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
+curl_setopt($ch, CURLOPT_TIMEOUT, 30);
+curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 10);
 
-if (!$host || !in_array($host, $ALLOWED_DOMAINS, true)) {
-    http_response_code(403);
-    echo json_encode(['error' => "Access to this domain is not permitted."]);
-    exit;
-}
+// Capture response headers
+$responseHeaders = [];
+curl_setopt($ch, CURLOPT_HEADERFUNCTION,
+    function($curl, $headerLine) use (&$responseHeaders) {
+        $len = strlen($headerLine);
+        $parts = explode(':', $headerLine, 2);
+        if (count($parts) < 2) return $len;
+        $responseHeaders[trim($parts[0])] = trim($parts[1]);
+        return $len;
+    }
+);
 
-// --- determine HTTP method ---
-$method = strtoupper($_SERVER['REQUEST_METHOD']);
-
-// --- read body if present ---
-$body = file_get_contents('php://input');
-
-// --- init CURL ---
-$ch = curl_init($decodedUrl);
-curl_setopt_array($ch, [
-    CURLOPT_RETURNTRANSFER => true,
-    CURLOPT_FOLLOWLOCATION => true,
-    CURLOPT_CUSTOMREQUEST => $method,
-    CURLOPT_TIMEOUT => $TIMEOUT,
-    CURLOPT_USERAGENT => 'PHP Proxy/1.1',
-    CURLOPT_SSL_VERIFYPEER => true,
-    CURLOPT_HEADER => true, // to capture headers
-]);
-
-// --- set headers from client ---
-$client_headers = getallheaders();
-$curl_headers = [];
-
-foreach ($client_headers as $key => $value) {
-    // skip host, content-length — cURL handles those automatically
-    if (in_array(strtolower($key), ['host', 'content-length'])) continue;
-    $curl_headers[] = "$key: $value";
-}
-curl_setopt($ch, CURLOPT_HTTPHEADER, $curl_headers);
-
-// attach body for POST/PUT/PATCH
+// If it's a POST/PUT/PATCH, forward the body
 if (in_array($method, ['POST', 'PUT', 'PATCH'])) {
-    curl_setopt($ch, CURLOPT_POSTFIELDS, $body);
+    $input = file_get_contents('php://input');
+    curl_setopt($ch, CURLOPT_POSTFIELDS, $input);
 }
 
-// --- execute request ---
 $response = curl_exec($ch);
-if ($response === false) {
-    http_response_code(502);
-    echo json_encode(['error' => 'cURL error: ' . curl_error($ch)]);
-    curl_close($ch);
-    exit;
-}
-
-// --- separate headers and body ---
-$header_size = curl_getinfo($ch, CURLINFO_HEADER_SIZE);
-$http_code   = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-$headers     = substr($response, 0, $header_size);
-$body        = substr($response, $header_size);
-
+$errno = curl_errno($ch);
+$error = curl_error($ch);
+$httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
 curl_close($ch);
 
-// --- forward response ---
-http_response_code($http_code);
-
-// forward key headers to client (e.g., content-type)
-foreach (explode("\r\n", $headers) as $header) {
-    if (stripos($header, 'Content-Type:') === 0 ||
-        stripos($header, 'Cache-Control:') === 0 ||
-        stripos($header, 'Pragma:') === 0
-    ) {
-        header($header);
-    }
+if ($errno !== 0) {
+    // Diagnostic output: include cURL error and attempted URL
+    http_response_code(502);
+    echo json_encode([
+        'error' => 'cURL request failed',
+        'curl_errno' => $errno,
+        'curl_error' => $error,
+        'attempted_url' => $url,
+        'note' => 'This may indicate outbound network is blocked by PaaS.'
+    ]);
+    exit;
 }
 
-echo $body;
+// Forward the remote status code and headers
+http_response_code($httpCode);
+foreach ($responseHeaders as $name => $value) {
+    header("$name: $value");
+}
+echo $response;
